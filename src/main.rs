@@ -32,6 +32,11 @@ enum Command {
         /// Optional secret for authentication.
         #[clap(short, long, env = "BORE_SECRET", hide_env_values = true)]
         secret: Option<String>,
+
+        #[clap(long)]
+        http_proxy_host: Option<String>,
+        #[clap(long)]
+        http_proxy_port: Option<u16>,
     },
 
     /// Runs the remote proxy server.
@@ -55,8 +60,20 @@ async fn run(command: Command) -> Result<()> {
             to,
             port,
             secret,
+            http_proxy_host,
+            http_proxy_port
         } => {
-            let client = Client::new(&local_host, local_port, &to, port, secret.as_deref()).await?;
+            let http_proxy = 
+            if let Some(http_proxy_host) = http_proxy_host{
+                let http_proxy = std::net::SocketAddr::new(
+                http_proxy_host.parse()?, http_proxy_port.unwrap());
+                Some(http_proxy)
+            }else{
+                None
+            };
+
+            let client = Client::new(&local_host, local_port, &to, port, secret.as_deref(),
+                http_proxy).await?;
             client.listen().await?;
         }
         Command::Server { min_port, secret } => {

@@ -1,8 +1,8 @@
 //! Client implementation for the `bore` service.
 
 use std::sync::Arc;
-
-use anyhow::{bail, Context, Result};
+use std::net::SocketAddr;
+use anyhow::{bail, Result};
 
 use tokio::io::AsyncWriteExt;
 use tokio::{net::TcpStream, time::timeout};
@@ -13,6 +13,7 @@ use crate::auth::Authenticator;
 use crate::shared::{
     proxy, ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT,
 };
+use async_http_proxy::http_connect_tokio;
 
 /// State structure for the client.
 pub struct Client {
@@ -33,6 +34,8 @@ pub struct Client {
 
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
+
+    http_proxy: Option<SocketAddr>,
 }
 
 impl Client {
@@ -43,11 +46,16 @@ impl Client {
         to: &str,
         port: u16,
         secret: Option<&str>,
+        http_proxy: Option<SocketAddr>,
     ) -> Result<Self> {
-        let mut stream = Delimited::new(connect_with_timeout(to, CONTROL_PORT).await?);
+
+        let mut stream = Delimited::new(
+            connect_with_timeout(to, CONTROL_PORT, &http_proxy).await?);
+        info!("connect ok");
         let auth = secret.map(Authenticator::new);
         if let Some(auth) = &auth {
             auth.client_handshake(&mut stream).await?;
+            info!("handshake ok");
         }
 
         stream.send(ClientMessage::Hello(port)).await?;
@@ -70,6 +78,7 @@ impl Client {
             local_port,
             remote_port,
             auth,
+            http_proxy,
         })
     }
 
@@ -88,6 +97,7 @@ impl Client {
                 Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                 Some(ServerMessage::Heartbeat) => (),
                 Some(ServerMessage::Connection(id)) => {
+                    info!("Got connection messaage with id {id}");
                     let this = Arc::clone(&this);
                     tokio::spawn(
                         async move {
@@ -107,25 +117,42 @@ impl Client {
     }
 
     async fn handle_connection(&self, id: Uuid) -> Result<()> {
+        // connect to remote
         let mut remote_conn =
-            Delimited::new(connect_with_timeout(&self.to[..], CONTROL_PORT).await?);
+            Delimited::new(connect_with_timeout(&self.to[..], CONTROL_PORT, 
+                &self.http_proxy).await?);
+        info!("connect to remote ok");
         if let Some(auth) = &self.auth {
             auth.client_handshake(&mut remote_conn).await?;
+            info!("handshake to remote ok");
         }
         remote_conn.send(ClientMessage::Accept(id)).await?;
-        let mut local_conn = connect_with_timeout(&self.local_host, self.local_port).await?;
+        // connect to local
+        let mut local_conn = connect_with_timeout(&self.local_host, self.local_port,
+            &None).await?;
+        info!("connect to local ok");
+
         let parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
+        // ???why
         local_conn.write_all(&parts.read_buf).await?; // mostly of the cases, this will be empty
         proxy(local_conn, parts.io).await?;
         Ok(())
     }
 }
 
-async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
-    match timeout(NETWORK_TIMEOUT, TcpStream::connect((to, port))).await {
-        Ok(res) => res,
-        Err(err) => Err(err.into()),
-    }
-    .with_context(|| format!("could not connect to {to}:{port}"))
+async fn connect_with_timeout(to: &str, port: u16, 
+    http_proxy: &Option<SocketAddr>,) -> Result<TcpStream> {
+    let stream = 
+        if let Some(http_proxy) = http_proxy {
+            let mut streamt = timeout(NETWORK_TIMEOUT, TcpStream::connect(http_proxy)).await??;
+            timeout(NETWORK_TIMEOUT,http_connect_tokio(&mut streamt, to, port)).await??;
+            info!("connect vis proxy {http_proxy} ok");
+            streamt
+        }else{
+            let streamt =TcpStream::connect((to, port)).await?;
+            info!("connect {to}:{port} ok");
+            streamt
+        };
+    Ok(stream)
 }
